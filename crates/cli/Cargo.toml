@@ -1,0 +1,13 @@
+[package]
+name = "rtxsimulator-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rtxsimulator.workspace = true
+tokio.workspace = true
+alloy-primitives.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true

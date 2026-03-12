@@ -1,0 +1,17 @@
+[package]
+name = "rtxsimulator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+revm.workspace = true
+alloy.workspace = true
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true

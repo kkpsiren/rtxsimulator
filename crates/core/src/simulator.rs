@@ -1,0 +1,346 @@
+use alloy::providers::{Provider, ProviderBuilder};
+use alloy_primitives::{Address, Bytes, U256};
+use revm::context::TxEnv;
+use revm::context_interface::result::{ExecutionResult, Output};
+use revm::database::{AlloyDB, CacheDB};
+use revm::database_interface::WrapDatabaseAsync;
+use revm::primitives::TxKind;
+use revm::state::AccountInfo;
+use revm::{Context, InspectEvm, MainBuilder, MainContext};
+use serde::Deserialize;
+use std::collections::HashMap;
+
+use crate::decoder::decode_effects;
+use crate::inspector::TxInspector;
+use crate::types::{Effect, EmittedLog, SimulationRequest, SimulationResult};
+
+type AlloyCacheDB =
+    CacheDB<WrapDatabaseAsync<AlloyDB<alloy::network::Ethereum, alloy::providers::DynProvider>>>;
+
+/// The main simulation entry point.
+///
+/// 1. `eth_createAccessList` to discover all touched addresses + storage slots
+/// 2. Pre-fetch all state in parallel via async provider
+/// 3. Populate CacheDB with warm state
+/// 4. Execute in revm — near-zero RPC calls during execution
+pub async fn simulate(req: &SimulationRequest, rpc_url: &str) -> anyhow::Result<SimulationResult> {
+    let provider = ProviderBuilder::new().connect(rpc_url).await?.erased();
+
+    let block_id = match req.block_number {
+        Some(n) => alloy::eips::BlockId::number(n),
+        None => alloy::eips::BlockId::latest(),
+    };
+
+    let block_tag = match req.block_number {
+        Some(n) => format!("{n:#x}"),
+        None => "latest".to_string(),
+    };
+
+    let gas_limit = req.gas_limit.unwrap_or(30_000_000);
+
+    // ── Phase 1: Discover state access patterns ───────────────────────
+    // Fetch access list to know exactly which addresses + slots are touched.
+    let access_list = if req.to.is_some() {
+        fetch_access_list(&provider, req, &block_tag, gas_limit).await
+    } else {
+        None
+    };
+
+    // ── Phase 2: Pre-fetch all state in parallel ──────────────────────
+    let prefetched = prefetch_state_async(&provider, req.from, req.to, &access_list, block_id).await;
+
+    // ── Phase 3: Build CacheDB with pre-warmed state ──────────────────
+    let alloy_db = WrapDatabaseAsync::new(AlloyDB::new(provider, block_id))
+        .ok_or_else(|| anyhow::anyhow!("failed to create async db wrapper (no tokio runtime?)"))?;
+    let mut cache_db = CacheDB::new(alloy_db);
+
+    // Insert pre-fetched accounts into cache.
+    for (addr, info) in &prefetched.accounts {
+        cache_db.insert_account_info(*addr, info.clone());
+    }
+    // Insert pre-fetched storage slots into cache.
+    for ((addr, slot), value) in &prefetched.storage {
+        cache_db.insert_account_storage(*addr, *slot, *value).ok();
+    }
+
+    // ── Phase 4: Build EVM + execute ──────────────────────────────────
+    let inspector = TxInspector::new();
+    let mut evm = Context::mainnet()
+        .with_db(cache_db)
+        .modify_cfg_chained(|cfg| {
+            cfg.chain_id = req.chain_id;
+            cfg.disable_nonce_check = true;
+            cfg.disable_balance_check = true;
+            cfg.disable_block_gas_limit = true;
+            cfg.tx_gas_limit_cap = Some(u64::MAX);
+        })
+        .build_mainnet_with_inspector(inspector);
+
+    let kind = match req.to {
+        Some(to) => TxKind::Call(to),
+        None => TxKind::Create,
+    };
+
+    let tx = TxEnv::builder()
+        .caller(req.from)
+        .kind(kind)
+        .data(req.data.clone())
+        .value(req.value)
+        .gas_limit(gas_limit)
+        .chain_id(Some(req.chain_id))
+        .build()
+        .map_err(|e| anyhow::anyhow!("invalid tx env: {e:?}"))?;
+
+    let result = evm.inspect_one_tx(tx)?;
+
+    // ── Phase 5: Collect + decode ─────────────────────────────────────
+    let inspector = &evm.inspector;
+    let logs: Vec<EmittedLog> = inspector.logs.clone();
+    let calls = inspector.calls.clone();
+    let selfdestructs = inspector.selfdestructs.clone();
+
+    let mut effects = decode_effects(&logs, &calls);
+
+    for (contract, beneficiary, balance) in &selfdestructs {
+        effects.push(Effect::SelfDestruct {
+            contract: *contract,
+            beneficiary: *beneficiary,
+            balance: *balance,
+        });
+    }
+
+    if req.to.is_none() {
+        if let ExecutionResult::Success {
+            output: Output::Create(_, Some(addr)),
+            ..
+        } = &result
+        {
+            effects.push(Effect::ContractCreated { address: *addr });
+        }
+    }
+
+    let (success, gas_used, return_data, revert_reason) = match &result {
+        ExecutionResult::Success { gas, output, .. } => {
+            let data = match output {
+                Output::Call(d) => d.clone(),
+                Output::Create(d, _) => d.clone(),
+            };
+            (true, gas.used(), data, None)
+        }
+        ExecutionResult::Revert { gas, output, .. } => {
+            let reason = decode_revert_reason(output);
+            (false, gas.used(), output.clone(), Some(reason))
+        }
+        ExecutionResult::Halt { reason, gas, .. } => {
+            (false, gas.used(), Bytes::new(), Some(format!("{reason:?}")))
+        }
+    };
+
+    Ok(SimulationResult {
+        success,
+        gas_used,
+        return_data,
+        revert_reason,
+        effects,
+        logs,
+        calls,
+    })
+}
+
+// ── Pre-fetched state container ───────────────────────────────────────
+
+struct PrefetchedState {
+    accounts: HashMap<Address, AccountInfo>,
+    storage: HashMap<(Address, U256), U256>,
+}
+
+/// Fetch all accounts and storage slots in parallel using async provider calls.
+async fn prefetch_state_async(
+    provider: &alloy::providers::DynProvider,
+    from: Address,
+    to: Option<Address>,
+    access_list: &Option<Vec<AccessListEntry>>,
+    block_id: alloy::eips::BlockId,
+) -> PrefetchedState {
+    use revm::bytecode::Bytecode;
+
+    // Collect all addresses we need to fetch.
+    let mut addresses: Vec<Address> = vec![from];
+    if let Some(to) = to {
+        addresses.push(to);
+    }
+    if let Some(al) = access_list {
+        for entry in al {
+            if !addresses.contains(&entry.address) {
+                addresses.push(entry.address);
+            }
+        }
+    }
+
+    // Fetch all accounts in parallel: (nonce, balance, code) per address.
+    let account_futures: Vec<_> = addresses
+        .iter()
+        .map(|addr| {
+            let provider = provider.clone();
+            let addr = *addr;
+            async move {
+                let (nonce_res, balance_res, code_res) = tokio::join!(
+                    provider.get_transaction_count(addr).block_id(block_id),
+                    provider.get_balance(addr).block_id(block_id),
+                    provider.get_code_at(addr).block_id(block_id),
+                );
+                let nonce = nonce_res.unwrap_or(0);
+                let balance = balance_res.unwrap_or(U256::ZERO);
+                let code = code_res.unwrap_or_default();
+                let code_hash = if code.is_empty() {
+                    revm::primitives::KECCAK_EMPTY
+                } else {
+                    alloy_primitives::keccak256(&code)
+                };
+                let bytecode = if code.is_empty() {
+                    Bytecode::default()
+                } else {
+                    Bytecode::new_raw(code)
+                };
+                (
+                    addr,
+                    AccountInfo {
+                        balance,
+                        nonce,
+                        code_hash,
+                        account_id: None,
+                        code: Some(bytecode),
+                    },
+                )
+            }
+        })
+        .collect();
+
+    // Collect all storage slots we need to fetch.
+    let mut storage_queries: Vec<(Address, U256)> = Vec::new();
+    if let Some(al) = access_list {
+        for entry in al {
+            if let Some(keys) = &entry.storage_keys {
+                for key in keys {
+                    storage_queries.push((entry.address, (*key).into()));
+                }
+            }
+        }
+    }
+
+    // Fetch all storage slots in parallel.
+    let storage_futures: Vec<_> = storage_queries
+        .iter()
+        .map(|(addr, slot)| {
+            let provider = provider.clone();
+            let addr = *addr;
+            let slot = *slot;
+            async move {
+                let value = provider
+                    .get_storage_at(addr, slot)
+                    .block_id(block_id)
+                    .await
+                    .unwrap_or(U256::ZERO);
+                ((addr, slot), value)
+            }
+        })
+        .collect();
+
+    // Await all concurrently.
+    let (accounts_results, storage_results) = tokio::join!(
+        futures::future::join_all(account_futures),
+        futures::future::join_all(storage_futures),
+    );
+
+    PrefetchedState {
+        accounts: accounts_results.into_iter().collect(),
+        storage: storage_results.into_iter().collect(),
+    }
+}
+
+// ── Access list types ─────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccessListResponse {
+    access_list: Vec<AccessListEntry>,
+    #[allow(dead_code)]
+    gas_used: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccessListEntry {
+    address: Address,
+    storage_keys: Option<Vec<alloy_primitives::B256>>,
+}
+
+/// Call eth_createAccessList to discover which addresses + storage slots the tx touches.
+async fn fetch_access_list(
+    provider: &alloy::providers::DynProvider,
+    req: &SimulationRequest,
+    block_tag: &str,
+    gas_limit: u64,
+) -> Option<Vec<AccessListEntry>> {
+    let call_obj = serde_json::json!({
+        "from": req.from,
+        "to": req.to,
+        "data": format!("0x{}", alloy_primitives::hex::encode(&req.data)),
+        "value": format!("{:#x}", req.value),
+        "gas": format!("{gas_limit:#x}"),
+        "maxFeePerGas": "0x77359400",
+        "maxPriorityFeePerGas": "0x0",
+    });
+
+    let result: Result<AccessListResponse, _> = provider
+        .raw_request("eth_createAccessList".into(), (call_obj, block_tag))
+        .await;
+
+    result.ok().map(|r| r.access_list)
+}
+
+/// Try to decode a revert reason from output bytes.
+fn decode_revert_reason(output: &Bytes) -> String {
+    if output.len() < 4 {
+        return format!("0x{}", alloy_primitives::hex::encode(output));
+    }
+
+    let selector = &output[..4];
+
+    // Error(string) — 0x08c379a0
+    if selector == [0x08, 0xc3, 0x79, 0xa0] && output.len() >= 68 {
+        let len_start = 4 + 32 + 32;
+        if len_start <= output.len() {
+            let len_bytes = &output[4 + 32..4 + 32 + 32];
+            let len = U256::from_be_slice(len_bytes)
+                .try_into()
+                .unwrap_or(0usize);
+            let str_start = len_start;
+            let str_end = (str_start + len).min(output.len());
+            if let Ok(s) = std::str::from_utf8(&output[str_start..str_end]) {
+                return s.to_string();
+            }
+        }
+    }
+
+    // Panic(uint256) — 0x4e487b71
+    if selector == [0x4e, 0x48, 0x7b, 0x71] && output.len() >= 36 {
+        let code = U256::from_be_slice(&output[4..36]);
+        let desc = match code.try_into().unwrap_or(0xffu64) {
+            0x00 => "generic compiler panic",
+            0x01 => "assertion failed",
+            0x11 => "arithmetic overflow/underflow",
+            0x12 => "division by zero",
+            0x21 => "invalid enum value",
+            0x22 => "invalid storage encoding",
+            0x31 => "pop on empty array",
+            0x32 => "array index out of bounds",
+            0x41 => "out of memory",
+            0x51 => "call to zero-initialized function pointer",
+            _ => "unknown panic code",
+        };
+        return format!("Panic({code}): {desc}");
+    }
+
+    format!("0x{}", alloy_primitives::hex::encode(output))
+}

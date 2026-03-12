@@ -1,0 +1,22 @@
+[workspace]
+members = ["crates/core", "crates/cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[workspace.dependencies]
+rtxsimulator = { path = "crates/core" }
+revm = { version = "36", features = ["std", "alloydb", "optional_balance_check", "optional_block_gas_limit"] }
+alloy = { version = "1", features = ["full", "json-rpc"] }
+alloy-primitives = "1"
+alloy-sol-types = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures = "0.3"
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive", "env"] }
