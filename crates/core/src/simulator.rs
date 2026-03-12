@@ -1,9 +1,9 @@
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy_primitives::{Address, Bytes, U256};
+use revm::bytecode::Bytecode;
 use revm::context::TxEnv;
 use revm::context_interface::result::{ExecutionResult, Output};
-use revm::database::{AlloyDB, CacheDB};
-use revm::database_interface::WrapDatabaseAsync;
+use revm::database::CacheDB;
 use revm::primitives::TxKind;
 use revm::state::AccountInfo;
 use revm::{Context, InspectEvm, MainBuilder, MainContext};
@@ -13,9 +13,6 @@ use std::collections::HashMap;
 use crate::decoder::decode_effects;
 use crate::inspector::TxInspector;
 use crate::types::{Effect, EmittedLog, SimulationRequest, SimulationResult};
-
-type AlloyCacheDB =
-    CacheDB<WrapDatabaseAsync<AlloyDB<alloy::network::Ethereum, alloy::providers::DynProvider>>>;
 
 /// The main simulation entry point.
 ///
@@ -39,7 +36,6 @@ pub async fn simulate(req: &SimulationRequest, rpc_url: &str) -> anyhow::Result<
     let gas_limit = req.gas_limit.unwrap_or(30_000_000);
 
     // ── Phase 1: Discover state access patterns ───────────────────────
-    // Fetch access list to know exactly which addresses + slots are touched.
     let access_list = if req.to.is_some() {
         fetch_access_list(&provider, req, &block_tag, gas_limit).await
     } else {
@@ -47,12 +43,11 @@ pub async fn simulate(req: &SimulationRequest, rpc_url: &str) -> anyhow::Result<
     };
 
     // ── Phase 2: Pre-fetch all state in parallel ──────────────────────
-    let prefetched = prefetch_state_async(&provider, req.from, req.to, &access_list, block_id).await;
+    let prefetched =
+        prefetch_state_async(&provider, req.from, req.to, &access_list, block_id).await;
 
     // ── Phase 3: Build CacheDB with pre-warmed state ──────────────────
-    let alloy_db = WrapDatabaseAsync::new(AlloyDB::new(provider, block_id))
-        .ok_or_else(|| anyhow::anyhow!("failed to create async db wrapper (no tokio runtime?)"))?;
-    let mut cache_db = CacheDB::new(alloy_db);
+    let mut cache_db = build_cache_db(&provider, block_id, &prefetched)?;
 
     // Insert pre-fetched accounts into cache.
     for (addr, info) in &prefetched.accounts {
@@ -147,11 +142,42 @@ pub async fn simulate(req: &SimulationRequest, rpc_url: &str) -> anyhow::Result<
     })
 }
 
+// ── CacheDB construction: native uses AlloyDB fallback, WASM uses EmptyDB ──
+
+#[cfg(not(target_arch = "wasm32"))]
+fn build_cache_db(
+    provider: &alloy::providers::DynProvider,
+    block_id: alloy::eips::BlockId,
+    _prefetched: &PrefetchedState,
+) -> anyhow::Result<
+    CacheDB<
+        revm::database_interface::WrapDatabaseAsync<
+            revm::database::AlloyDB<alloy::network::Ethereum, alloy::providers::DynProvider>,
+        >,
+    >,
+> {
+    use revm::database::AlloyDB;
+    use revm::database_interface::WrapDatabaseAsync;
+
+    let alloy_db = WrapDatabaseAsync::new(AlloyDB::new(provider.clone(), block_id))
+        .ok_or_else(|| anyhow::anyhow!("failed to create async db wrapper (no tokio runtime?)"))?;
+    Ok(CacheDB::new(alloy_db))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn build_cache_db(
+    _provider: &alloy::providers::DynProvider,
+    _block_id: alloy::eips::BlockId,
+    _prefetched: &PrefetchedState,
+) -> anyhow::Result<CacheDB<revm::database::EmptyDB>> {
+    Ok(CacheDB::new(revm::database::EmptyDB::new()))
+}
+
 // ── Pre-fetched state container ───────────────────────────────────────
 
-struct PrefetchedState {
-    accounts: HashMap<Address, AccountInfo>,
-    storage: HashMap<(Address, U256), U256>,
+pub(crate) struct PrefetchedState {
+    pub accounts: HashMap<Address, AccountInfo>,
+    pub storage: HashMap<(Address, U256), U256>,
 }
 
 /// Fetch all accounts and storage slots in parallel using async provider calls.
@@ -162,12 +188,12 @@ async fn prefetch_state_async(
     access_list: &Option<Vec<AccessListEntry>>,
     block_id: alloy::eips::BlockId,
 ) -> PrefetchedState {
-    use revm::bytecode::Bytecode;
-
     // Collect all addresses we need to fetch.
     let mut addresses: Vec<Address> = vec![from];
     if let Some(to) = to {
-        addresses.push(to);
+        if !addresses.contains(&to) {
+            addresses.push(to);
+        }
     }
     if let Some(al) = access_list {
         for entry in al {
@@ -184,10 +210,11 @@ async fn prefetch_state_async(
             let provider = provider.clone();
             let addr = *addr;
             async move {
-                let (nonce_res, balance_res, code_res) = tokio::join!(
-                    provider.get_transaction_count(addr).block_id(block_id),
-                    provider.get_balance(addr).block_id(block_id),
-                    provider.get_code_at(addr).block_id(block_id),
+                use std::future::IntoFuture;
+                let (nonce_res, balance_res, code_res) = futures::join!(
+                    provider.get_transaction_count(addr).block_id(block_id).into_future(),
+                    provider.get_balance(addr).block_id(block_id).into_future(),
+                    provider.get_code_at(addr).block_id(block_id).into_future(),
                 );
                 let nonce = nonce_res.unwrap_or(0);
                 let balance = balance_res.unwrap_or(U256::ZERO);
@@ -247,7 +274,7 @@ async fn prefetch_state_async(
         .collect();
 
     // Await all concurrently.
-    let (accounts_results, storage_results) = tokio::join!(
+    let (accounts_results, storage_results) = futures::join!(
         futures::future::join_all(account_futures),
         futures::future::join_all(storage_futures),
     );

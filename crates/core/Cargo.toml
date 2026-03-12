@@ -5,13 +5,54 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-revm.workspace = true
-alloy.workspace = true
 alloy-primitives.workspace = true
 alloy-sol-types.workspace = true
-tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 futures.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+
+# ── revm: shared features ────────────────────────────────────────────
+# Native adds alloydb + C crypto; WASM uses pure-Rust + EmptyDB only.
+[dependencies.revm]
+version = "36"
+default-features = false
+features = ["std", "optional_balance_check", "optional_block_gas_limit"]
+
+# ── alloy: shared base ───────────────────────────────────────────────
+[dependencies.alloy]
+version = "1"
+default-features = false
+features = ["provider-http", "rpc-types", "json-rpc"]
+
+# ── Native-only deps ─────────────────────────────────────────────────
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.revm]
+version = "36"
+default-features = false
+features = [
+    "std", "alloydb",
+    "secp256k1", "c-kzg", "blst",
+    "optional_balance_check", "optional_block_gas_limit",
+]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.alloy]
+version = "1"
+features = ["full", "json-rpc"]
+
+# ── WASM-only deps ───────────────────────────────────────────────────
+[target.'cfg(target_arch = "wasm32")'.dependencies.revm]
+version = "36"
+default-features = false
+features = [
+    "std",
+    "optional_balance_check", "optional_block_gas_limit",
+]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.alloy]
+version = "1"
+default-features = false
+features = ["provider-http", "rpc-types", "json-rpc", "reqwest", "wasm-bindgen"]

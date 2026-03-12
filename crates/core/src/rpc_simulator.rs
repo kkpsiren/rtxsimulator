@@ -44,7 +44,7 @@ pub async fn simulate_rpc(
         (call_request, block_tag, trace_opts),
     );
 
-    let (eth_call_result, trace_result) = tokio::join!(eth_call_fut, trace_fut);
+    let (eth_call_result, trace_result) = futures::join!(eth_call_fut, trace_fut);
 
     // ── Process eth_call result ───────────────────────────────────────
     let (success, return_data, revert_reason) = match eth_call_result {

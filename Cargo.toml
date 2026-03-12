@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/cli"]
+members = ["crates/core", "crates/cli", "crates/wasm"]
 resolver = "2"
 
 [workspace.package]
@@ -9,14 +9,19 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 rtxsimulator = { path = "crates/core" }
-revm = { version = "36", features = ["std", "alloydb", "optional_balance_check", "optional_block_gas_limit"] }
-alloy = { version = "1", features = ["full", "json-rpc"] }
 alloy-primitives = "1"
 alloy-sol-types = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures = "0.3"
 anyhow = "1"
 thiserror = "2"
+
+# Native-only
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 clap = { version = "4", features = ["derive", "env"] }
+
+# WASM-only
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+serde-wasm-bindgen = "0.6"

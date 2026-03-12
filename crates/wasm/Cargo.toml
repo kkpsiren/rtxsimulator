@@ -1,0 +1,15 @@
+[package]
+name = "rtxsimulator-wasm"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rtxsimulator.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+serde-wasm-bindgen.workspace = true
+serde_json.workspace = true
+getrandom = { version = "0.2", features = ["js"] }
