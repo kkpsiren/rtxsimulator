@@ -44,8 +44,13 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let data: Bytes = args.data.parse()?;
-    let value = U256::from_str_radix(args.value.trim_start_matches("0x"), 10)
-        .unwrap_or_else(|_| U256::from_str_radix(&args.value, 16).expect("invalid value"));
+    let value = if args.value.starts_with("0x") {
+        U256::from_str_radix(args.value.trim_start_matches("0x"), 16)
+            .map_err(|_| anyhow::anyhow!("invalid hex value: {}", args.value))?
+    } else {
+        U256::from_str_radix(&args.value, 10)
+            .map_err(|_| anyhow::anyhow!("invalid decimal value: {}", args.value))?
+    };
 
     let req = SimulationRequest {
         from: args.from,

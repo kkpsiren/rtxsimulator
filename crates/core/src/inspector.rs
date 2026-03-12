@@ -25,7 +25,7 @@ impl<CTX, INTR: revm::interpreter::InterpreterTypes> Inspector<CTX, INTR> for Tx
         self.logs.push(EmittedLog {
             address: log.address,
             topics: log.topics().to_vec(),
-            data: Bytes::copy_from_slice(log.data.data.as_ref()),
+            data: log.data.data,
         });
     }
 

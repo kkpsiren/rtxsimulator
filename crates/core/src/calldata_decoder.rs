@@ -37,6 +37,7 @@ pub fn decode_calldata_effects(
         }
         SET_APPROVAL_FOR_ALL => decode_set_approval_for_all(contract, caller, params),
         SAFE_TRANSFER_FROM_1155 => decode_safe_transfer_1155(contract, params),
+        SAFE_BATCH_TRANSFER_1155 => decode_safe_batch_transfer_1155(contract, params),
         PERMIT => decode_permit(contract, params),
         _ => Vec::new(),
     }
@@ -192,4 +193,58 @@ fn decode_permit(token: Address, params: &[u8]) -> Vec<Effect> {
         spender,
         value,
     }]
+}
+
+// safeBatchTransferFrom(address from, address to, uint256[] ids, uint256[] values, bytes data)
+fn decode_safe_batch_transfer_1155(token: Address, params: &[u8]) -> Vec<Effect> {
+    let Some(from) = read_address(params, 0) else {
+        return Vec::new();
+    };
+    let Some(to) = read_address(params, 32) else {
+        return Vec::new();
+    };
+    // ids array: offset at word 2 (byte 64), values array: offset at word 3 (byte 96)
+    let Some(ids_offset) = read_u256(params, 64) else {
+        return Vec::new();
+    };
+    let Some(values_offset) = read_u256(params, 96) else {
+        return Vec::new();
+    };
+    let ids_offset: usize = ids_offset.try_into().unwrap_or(usize::MAX);
+    let values_offset: usize = values_offset.try_into().unwrap_or(usize::MAX);
+
+    let ids = read_u256_array(params, ids_offset);
+    let values = read_u256_array(params, values_offset);
+
+    if ids.is_empty() || ids.len() != values.len() {
+        return Vec::new();
+    }
+
+    vec![Effect::Erc1155TransferBatch {
+        token,
+        operator: from,
+        from,
+        to,
+        ids,
+        values,
+    }]
+}
+
+/// Read a dynamic uint256[] array from ABI-encoded params at the given byte offset.
+fn read_u256_array(params: &[u8], offset: usize) -> Vec<U256> {
+    let Some(len) = read_u256(params, offset) else {
+        return Vec::new();
+    };
+    let len: usize = len.try_into().unwrap_or(usize::MAX);
+    if len > 1024 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let Some(val) = read_u256(params, offset + 32 + i * 32) else {
+            return Vec::new();
+        };
+        out.push(val);
+    }
+    out
 }

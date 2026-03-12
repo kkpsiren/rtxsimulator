@@ -69,77 +69,56 @@ pub fn decode_effects(logs: &[EmittedLog], calls: &[InternalCall]) -> Vec<Effect
 }
 
 fn decode_log(log: &EmittedLog) -> Option<Effect> {
-    if log.topics.is_empty() {
-        return None;
-    }
-
-    let topic0 = log.topics[0];
+    let topic0 = *log.topics.first()?;
     let token = log.address;
+    let topics = log.topics.iter().copied();
 
-    // Transfer — could be ERC-20 (2 indexed + data) or ERC-721 (3 indexed)
-    if topic0 == Transfer::SIGNATURE_HASH {
-        return decode_transfer(token, &log.topics, &log.data);
-    }
-
-    // Approval (ERC-20 or EIP-2612 permit — same event)
-    if topic0 == Approval::SIGNATURE_HASH {
-        return decode_approval(token, &log.topics, &log.data);
-    }
-
-    // ERC-1155 TransferSingle
-    if topic0 == TransferSingle::SIGNATURE_HASH {
-        if let Ok(ev) = TransferSingle::decode_raw_log(log.topics.iter().copied(), &log.data) {
-            return Some(Effect::Erc1155TransferSingle {
+    match topic0 {
+        t if t == Transfer::SIGNATURE_HASH => decode_transfer(token, &log.topics, &log.data),
+        t if t == Approval::SIGNATURE_HASH => decode_approval(token, &log.topics, &log.data),
+        t if t == TransferSingle::SIGNATURE_HASH => {
+            let ev = TransferSingle::decode_raw_log(topics, &log.data).ok()?;
+            Some(Effect::Erc1155TransferSingle {
                 token,
                 operator: ev.operator,
                 from: ev.from,
                 to: ev.to,
                 id: ev.id,
                 value: ev.value,
-            });
+            })
         }
-    }
-
-    // ERC-1155 TransferBatch
-    if topic0 == TransferBatch::SIGNATURE_HASH {
-        if let Ok(ev) = TransferBatch::decode_raw_log(log.topics.iter().copied(), &log.data) {
-            return Some(Effect::Erc1155TransferBatch {
+        t if t == TransferBatch::SIGNATURE_HASH => {
+            let ev = TransferBatch::decode_raw_log(topics, &log.data).ok()?;
+            Some(Effect::Erc1155TransferBatch {
                 token,
                 operator: ev.operator,
                 from: ev.from,
                 to: ev.to,
                 ids: ev.ids,
                 values: ev.values,
-            });
+            })
         }
-    }
-
-    // ApprovalForAll
-    if topic0 == ApprovalForAll::SIGNATURE_HASH {
-        if let Ok(ev) = ApprovalForAll::decode_raw_log(log.topics.iter().copied(), &log.data) {
-            return Some(Effect::ApprovalForAll {
+        t if t == ApprovalForAll::SIGNATURE_HASH => {
+            let ev = ApprovalForAll::decode_raw_log(topics, &log.data).ok()?;
+            Some(Effect::ApprovalForAll {
                 token,
                 owner: ev.account,
                 operator: ev.operator,
                 approved: ev.approved,
-            });
+            })
         }
-    }
-
-    // Permit2
-    if topic0 == Permit2Approval::SIGNATURE_HASH {
-        if let Ok(ev) = Permit2Approval::decode_raw_log(log.topics.iter().copied(), &log.data) {
-            return Some(Effect::Permit2Approval {
+        t if t == Permit2Approval::SIGNATURE_HASH => {
+            let ev = Permit2Approval::decode_raw_log(topics, &log.data).ok()?;
+            Some(Effect::Permit2Approval {
                 token: ev.token,
                 owner: ev.owner,
                 spender: ev.spender,
                 amount: U256::from(ev.amount),
                 expiration: U256::from(ev.expiration),
-            });
+            })
         }
+        _ => None,
     }
-
-    None
 }
 
 /// Distinguish ERC-20 Transfer (2 indexed args + uint256 data) from
@@ -158,11 +137,11 @@ fn decode_transfer(token: Address, topics: &[B256], data: &Bytes) -> Option<Effe
         });
     }
 
-    // ERC-20: 3 topics (sig + from + to), 32 bytes data = value
-    if topics.len() == 3 && data.len() == 32 {
+    // ERC-20: 3 topics (sig + from + to), >= 32 bytes data (value in first word)
+    if topics.len() == 3 && data.len() >= 32 {
         let from = Address::from_word(topics[1]);
         let to = Address::from_word(topics[2]);
-        let value = U256::from_be_slice(data);
+        let value = U256::from_be_slice(&data[..32]);
         return Some(Effect::Erc20Transfer {
             token,
             from,
@@ -175,10 +154,10 @@ fn decode_transfer(token: Address, topics: &[B256], data: &Bytes) -> Option<Effe
 }
 
 fn decode_approval(token: Address, topics: &[B256], data: &Bytes) -> Option<Effect> {
-    if topics.len() == 3 && data.len() == 32 {
+    if topics.len() == 3 && data.len() >= 32 {
         let owner = Address::from_word(topics[1]);
         let spender = Address::from_word(topics[2]);
-        let value = U256::from_be_slice(data);
+        let value = U256::from_be_slice(&data[..32]);
         return Some(Effect::Erc20Approval {
             token,
             owner,

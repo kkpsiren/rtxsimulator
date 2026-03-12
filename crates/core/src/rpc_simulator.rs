@@ -88,16 +88,15 @@ pub async fn simulate_rpc(
         effects.extend(decode_calldata_effects(to, req.from, &req.data));
     }
 
-    let top_data = &req.data;
     for call in &user_calls {
-        if call.value > U256::ZERO && !is_system_address(&call.target) {
+        if call.value > U256::ZERO {
             effects.push(Effect::NativeTransfer {
                 from: call.caller,
                 to: call.target,
                 value: call.value,
             });
         }
-        if call.input != *top_data && !is_system_address(&call.target) {
+        if call.input != req.data {
             effects.extend(decode_calldata_effects(call.target, call.caller, &call.input));
         }
     }
@@ -122,14 +121,11 @@ pub async fn simulate_rpc(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
 struct CallTrace {
     from: Address,
     to: Address,
     #[serde(default)]
     input: String,
-    #[serde(default)]
-    output: String,
     #[serde(default)]
     value: String,
     #[serde(default)]
@@ -138,10 +134,6 @@ struct CallTrace {
     gas_used: String,
     #[serde(default, rename = "type")]
     call_type: String,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    revert_reason: Option<String>,
     #[serde(default)]
     calls: Vec<CallTrace>,
     #[serde(default)]

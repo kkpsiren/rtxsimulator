@@ -8,11 +8,11 @@ use revm::primitives::TxKind;
 use revm::state::AccountInfo;
 use revm::{Context, InspectEvm, MainBuilder, MainContext};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::decoder::decode_effects;
 use crate::inspector::TxInspector;
-use crate::types::{Effect, EmittedLog, SimulationRequest, SimulationResult};
+use crate::types::{Effect, SimulationRequest, SimulationResult};
 
 /// The main simulation entry point.
 ///
@@ -44,7 +44,7 @@ pub async fn simulate(req: &SimulationRequest, rpc_url: &str) -> anyhow::Result<
 
     // ── Phase 2: Pre-fetch all state in parallel ──────────────────────
     let prefetched =
-        prefetch_state_async(&provider, req.from, req.to, &access_list, block_id).await;
+        prefetch_state_async(&provider, req.from, req.to, access_list.as_deref(), block_id).await;
 
     // ── Phase 3: Build CacheDB with pre-warmed state ──────────────────
     let mut cache_db = build_cache_db(&provider, block_id, &prefetched)?;
@@ -89,42 +89,42 @@ pub async fn simulate(req: &SimulationRequest, rpc_url: &str) -> anyhow::Result<
     let result = evm.inspect_one_tx(tx)?;
 
     // ── Phase 5: Collect + decode ─────────────────────────────────────
-    let inspector = &evm.inspector;
-    let logs: Vec<EmittedLog> = inspector.logs.clone();
-    let calls = inspector.calls.clone();
-    let selfdestructs = inspector.selfdestructs.clone();
+    // Move fields out of the inspector to avoid cloning.
+    let inspector = evm.inspector;
+    let logs = inspector.logs;
+    let calls = inspector.calls;
+    let selfdestructs = inspector.selfdestructs;
 
     let mut effects = decode_effects(&logs, &calls);
 
-    for (contract, beneficiary, balance) in &selfdestructs {
+    for (contract, beneficiary, balance) in selfdestructs {
         effects.push(Effect::SelfDestruct {
-            contract: *contract,
-            beneficiary: *beneficiary,
-            balance: *balance,
+            contract,
+            beneficiary,
+            balance,
         });
     }
 
-    if req.to.is_none() {
-        if let ExecutionResult::Success {
+    if req.to.is_none()
+        && let ExecutionResult::Success {
             output: Output::Create(_, Some(addr)),
             ..
         } = &result
-        {
-            effects.push(Effect::ContractCreated { address: *addr });
-        }
+    {
+        effects.push(Effect::ContractCreated { address: *addr });
     }
 
-    let (success, gas_used, return_data, revert_reason) = match &result {
+    let (success, gas_used, return_data, revert_reason) = match result {
         ExecutionResult::Success { gas, output, .. } => {
             let data = match output {
-                Output::Call(d) => d.clone(),
-                Output::Create(d, _) => d.clone(),
+                Output::Call(d) => d,
+                Output::Create(d, _) => d,
             };
             (true, gas.used(), data, None)
         }
         ExecutionResult::Revert { gas, output, .. } => {
-            let reason = decode_revert_reason(output);
-            (false, gas.used(), output.clone(), Some(reason))
+            let reason = decode_revert_reason(&output);
+            (false, gas.used(), output, Some(reason))
         }
         ExecutionResult::Halt { reason, gas, .. } => {
             (false, gas.used(), Bytes::new(), Some(format!("{reason:?}")))
@@ -185,21 +185,18 @@ async fn prefetch_state_async(
     provider: &alloy::providers::DynProvider,
     from: Address,
     to: Option<Address>,
-    access_list: &Option<Vec<AccessListEntry>>,
+    access_list: Option<&[AccessListEntry]>,
     block_id: alloy::eips::BlockId,
 ) -> PrefetchedState {
-    // Collect all addresses we need to fetch.
-    let mut addresses: Vec<Address> = vec![from];
-    if let Some(to) = to {
-        if !addresses.contains(&to) {
-            addresses.push(to);
-        }
-    }
-    if let Some(al) = access_list {
-        for entry in al {
-            if !addresses.contains(&entry.address) {
-                addresses.push(entry.address);
-            }
+    // Collect unique addresses to fetch.
+    let mut seen = HashSet::new();
+    let mut addresses = Vec::new();
+    for addr in std::iter::once(from)
+        .chain(to)
+        .chain(access_list.into_iter().flatten().map(|e| e.address))
+    {
+        if seen.insert(addr) {
+            addresses.push(addr);
         }
     }
 
@@ -244,16 +241,17 @@ async fn prefetch_state_async(
         .collect();
 
     // Collect all storage slots we need to fetch.
-    let mut storage_queries: Vec<(Address, U256)> = Vec::new();
-    if let Some(al) = access_list {
-        for entry in al {
-            if let Some(keys) = &entry.storage_keys {
-                for key in keys {
-                    storage_queries.push((entry.address, (*key).into()));
-                }
-            }
-        }
-    }
+    let storage_queries: Vec<(Address, U256)> = access_list
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .storage_keys
+                .as_ref()
+                .map(|keys| keys.iter().map(move |key| (entry.address, (*key).into())))
+        })
+        .flatten()
+        .collect();
 
     // Fetch all storage slots in parallel.
     let storage_futures: Vec<_> = storage_queries
@@ -291,8 +289,8 @@ async fn prefetch_state_async(
 #[serde(rename_all = "camelCase")]
 struct AccessListResponse {
     access_list: Vec<AccessListEntry>,
-    #[allow(dead_code)]
-    gas_used: String,
+    #[serde(rename = "gasUsed")]
+    _gas_used: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -335,18 +333,14 @@ fn decode_revert_reason(output: &Bytes) -> String {
     let selector = &output[..4];
 
     // Error(string) — 0x08c379a0
+    // Layout: selector(4) + offset(32) + length(32) + string data
     if selector == [0x08, 0xc3, 0x79, 0xa0] && output.len() >= 68 {
-        let len_start = 4 + 32 + 32;
-        if len_start <= output.len() {
-            let len_bytes = &output[4 + 32..4 + 32 + 32];
-            let len = U256::from_be_slice(len_bytes)
-                .try_into()
-                .unwrap_or(0usize);
-            let str_start = len_start;
-            let str_end = (str_start + len).min(output.len());
-            if let Ok(s) = std::str::from_utf8(&output[str_start..str_end]) {
-                return s.to_string();
-            }
+        let len = U256::from_be_slice(&output[36..68])
+            .try_into()
+            .unwrap_or(0usize);
+        let str_end = (68 + len).min(output.len());
+        if let Ok(s) = std::str::from_utf8(&output[68..str_end]) {
+            return s.to_string();
         }
     }
 
