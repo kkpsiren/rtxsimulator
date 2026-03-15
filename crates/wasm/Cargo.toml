@@ -1,5 +1,5 @@
 [package]
-name = "rtxsimulator-wasm"
+name = "simulate-tx"
 version.workspace = true
 edition.workspace = true
 

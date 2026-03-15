@@ -1,10 +1,5 @@
 // Quick test: run with `node examples/test.mjs`
-import init, { simulate } from '../crates/wasm/pkg/rtxsimulator_wasm.js';
-import { readFileSync } from 'fs';
-
-// Load WASM manually for Node.js
-const wasmBuffer = readFileSync(new URL('../crates/wasm/pkg/rtxsimulator_wasm_bg.wasm', import.meta.url));
-await init(wasmBuffer);
+import { simulate } from '../crates/wasm/pkg/simulate_tx.js';
 
 // Simulate an ERC-20 approve on Lens
 const result = await simulate(

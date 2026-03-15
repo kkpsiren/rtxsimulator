@@ -3592,18 +3592,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rtxsimulator-wasm"
-version = "0.1.0"
-dependencies = [
- "getrandom 0.2.17",
- "rtxsimulator",
- "serde-wasm-bindgen",
- "serde_json",
- "wasm-bindgen",
- "wasm-bindgen-futures",
-]
-
-[[package]]
 name = "ruint"
 version = "1.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4019,6 +4007,18 @@ checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "digest 0.10.7",
  "rand_core 0.6.4",
+]
+
+[[package]]
+name = "simulate-tx"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "rtxsimulator",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
 ]
 
 [[package]]

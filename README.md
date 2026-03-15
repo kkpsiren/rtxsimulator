@@ -61,21 +61,16 @@ Outputs JSON:
 
 `--rpc-url` can also be set via `RPC_URL` env var.
 
-### WASM (JS/TS)
+### npm package (`simulate-tx`)
 
 ```bash
-# For <script type="module"> / Deno / Node
-wasm-pack build crates/wasm --target web --release
-
-# For npm/webpack/vite bundlers
-wasm-pack build crates/wasm --target bundler --release
+npm install simulate-tx
 ```
 
 Usage:
 
 ```typescript
-import init, { simulate, simulateFromObject } from './pkg/rtxsimulator_wasm.js';
-await init();
+import { simulate, simulateFromObject } from 'simulate-tx';
 
 // From JSON string
 const result = await simulate('https://rpc.lens.xyz', JSON.stringify({
@@ -86,7 +81,7 @@ const result = await simulate('https://rpc.lens.xyz', JSON.stringify({
   chain_id: 232,
 }));
 
-// Or from a JS object directly
+// Or pass a JS object directly
 const result = await simulateFromObject('https://rpc.lens.xyz', {
   from: '0x4bD23Ea1F559861096697f5612D293E43749F8f9',
   to: '0x6bDc36E20D267Ff0dd6097799f82e78907105e2F',
