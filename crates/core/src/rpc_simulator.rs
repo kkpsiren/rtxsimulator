@@ -5,10 +5,11 @@ use serde::Deserialize;
 use crate::calldata_decoder::decode_calldata_effects;
 use crate::types::{CallType, Effect, EmittedLog, InternalCall, SimulationRequest, SimulationResult};
 
-/// RPC-based simulator for chains where revm can't run natively (ZkSync, Lens, etc.).
+/// RPC-based simulator for EraVM chains where revm can't execute natively.
 /// Uses `debug_traceCall` with callTracer + calldata decoding.
 ///
-/// Optimization: eth_call and debug_traceCall run concurrently.
+/// Works on any chain that supports the `debug_traceCall` JSON-RPC method.
+/// eth_call and debug_traceCall run concurrently for speed.
 pub async fn simulate_rpc(
     req: &SimulationRequest,
     rpc_url: &str,
