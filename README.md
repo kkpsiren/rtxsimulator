@@ -190,6 +190,10 @@ crates/cli    → Native CLI binary
 crates/wasm   → WebAssembly package (npm: simulate-tx)
 ```
 
+## Release
+
+The release process is documented in [docs/release-workflow.md](docs/release-workflow.md). Follow that workflow to keep the workspace version, git tags, and published packages aligned.
+
 ## License
 
 MIT

@@ -3,8 +3,8 @@ use wasm_bindgen::prelude::*;
 
 /// Simulate an EVM transaction.
 ///
-/// Accepts a JSON object with: from, to, data, value, chainId, blockNumber?, gasLimit?
-/// Returns a JSON object with: success, gasUsed, returnData, revertReason, effects, logs, calls
+/// Accepts a JSON object with: from, to, data, value, chain_id, block_number?, gas_limit?
+/// Returns a JSON object with: success, gas_used, return_data, revert_reason, effects, logs, calls
 #[wasm_bindgen]
 pub async fn simulate(rpc_url: &str, request_json: &str) -> Result<JsValue, JsError> {
     let req: SimulationRequest =

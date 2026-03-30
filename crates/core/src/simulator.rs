@@ -44,7 +44,7 @@ pub async fn simulate(req: &SimulationRequest, rpc_url: &str) -> anyhow::Result<
 
     // ── Phase 2: Pre-fetch all state in parallel ──────────────────────
     let prefetched =
-        prefetch_state_async(&provider, req.from, req.to, access_list.as_deref(), block_id).await;
+        prefetch_state_async(&provider, req.from, req.to, access_list.as_deref(), block_id).await?;
 
     // ── Phase 3: Build CacheDB with pre-warmed state ──────────────────
     let mut cache_db = build_cache_db(&provider, block_id, &prefetched)?;
@@ -187,7 +187,7 @@ async fn prefetch_state_async(
     to: Option<Address>,
     access_list: Option<&[AccessListEntry]>,
     block_id: alloy::eips::BlockId,
-) -> PrefetchedState {
+) -> anyhow::Result<PrefetchedState> {
     // Collect unique addresses to fetch.
     let mut seen = HashSet::new();
     let mut addresses = Vec::new();
@@ -213,45 +213,18 @@ async fn prefetch_state_async(
                     provider.get_balance(addr).block_id(block_id).into_future(),
                     provider.get_code_at(addr).block_id(block_id).into_future(),
                 );
-                let nonce = nonce_res.unwrap_or(0);
-                let balance = balance_res.unwrap_or(U256::ZERO);
-                let code = code_res.unwrap_or_default();
-                let code_hash = if code.is_empty() {
-                    revm::primitives::KECCAK_EMPTY
-                } else {
-                    alloy_primitives::keccak256(&code)
-                };
-                let bytecode = if code.is_empty() {
-                    Bytecode::default()
-                } else {
-                    Bytecode::new_raw(code)
-                };
-                (
+                build_account_info(
                     addr,
-                    AccountInfo {
-                        balance,
-                        nonce,
-                        code_hash,
-                        account_id: None,
-                        code: Some(bytecode),
-                    },
+                    nonce_res.map_err(Into::into),
+                    balance_res.map_err(Into::into),
+                    code_res.map_err(Into::into),
                 )
             }
         })
         .collect();
 
     // Collect all storage slots we need to fetch.
-    let storage_queries: Vec<(Address, U256)> = access_list
-        .into_iter()
-        .flatten()
-        .filter_map(|entry| {
-            entry
-                .storage_keys
-                .as_ref()
-                .map(|keys| keys.iter().map(move |key| (entry.address, (*key).into())))
-        })
-        .flatten()
-        .collect();
+    let storage_queries = collect_storage_queries(access_list);
 
     // Fetch all storage slots in parallel.
     let storage_futures: Vec<_> = storage_queries
@@ -261,26 +234,90 @@ async fn prefetch_state_async(
             let addr = *addr;
             let slot = *slot;
             async move {
-                let value = provider
-                    .get_storage_at(addr, slot)
-                    .block_id(block_id)
-                    .await
-                    .unwrap_or(U256::ZERO);
-                ((addr, slot), value)
+                build_storage_entry(
+                    addr,
+                    slot,
+                    provider
+                        .get_storage_at(addr, slot)
+                        .block_id(block_id)
+                        .await
+                        .map_err(Into::into),
+                )
             }
         })
         .collect();
 
     // Await all concurrently.
     let (accounts_results, storage_results) = futures::join!(
-        futures::future::join_all(account_futures),
-        futures::future::join_all(storage_futures),
+        futures::future::try_join_all(account_futures),
+        futures::future::try_join_all(storage_futures),
     );
 
-    PrefetchedState {
-        accounts: accounts_results.into_iter().collect(),
-        storage: storage_results.into_iter().collect(),
+    Ok(PrefetchedState {
+        accounts: accounts_results?.into_iter().collect(),
+        storage: storage_results?.into_iter().collect(),
+    })
+}
+
+fn build_account_info(
+    addr: Address,
+    nonce_res: anyhow::Result<u64>,
+    balance_res: anyhow::Result<U256>,
+    code_res: anyhow::Result<Bytes>,
+) -> anyhow::Result<(Address, AccountInfo)> {
+    let nonce =
+        nonce_res.map_err(|err| anyhow::anyhow!("failed to fetch nonce for {addr}: {err}"))?;
+    let balance =
+        balance_res.map_err(|err| anyhow::anyhow!("failed to fetch balance for {addr}: {err}"))?;
+    let code =
+        code_res.map_err(|err| anyhow::anyhow!("failed to fetch code for {addr}: {err}"))?;
+    let code_hash = if code.is_empty() {
+        revm::primitives::KECCAK_EMPTY
+    } else {
+        alloy_primitives::keccak256(&code)
+    };
+    let bytecode = if code.is_empty() {
+        Bytecode::default()
+    } else {
+        Bytecode::new_raw(code)
+    };
+
+    Ok((
+        addr,
+        AccountInfo {
+            balance,
+            nonce,
+            code_hash,
+            account_id: None,
+            code: Some(bytecode),
+        },
+    ))
+}
+
+fn build_storage_entry(
+    addr: Address,
+    slot: U256,
+    value_res: anyhow::Result<U256>,
+) -> anyhow::Result<((Address, U256), U256)> {
+    let value = value_res
+        .map_err(|err| anyhow::anyhow!("failed to fetch storage for {addr} at {slot}: {err}"))?;
+    Ok(((addr, slot), value))
+}
+
+fn collect_storage_queries(access_list: Option<&[AccessListEntry]>) -> Vec<(Address, U256)> {
+    let mut seen = HashSet::new();
+    let mut queries = Vec::new();
+
+    for entry in access_list.into_iter().flatten() {
+        for key in entry.storage_keys.as_ref().into_iter().flatten() {
+            let query = (entry.address, (*key).into());
+            if seen.insert(query) {
+                queries.push(query);
+            }
+        }
     }
+
+    queries
 }
 
 // ── Access list types ─────────────────────────────────────────────────
@@ -364,4 +401,52 @@ fn decode_revert_reason(output: &Bytes) -> String {
     }
 
     format!("0x{}", alloy_primitives::hex::encode(output))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_prefetch_propagates_rpc_errors() {
+        let addr: Address = "0x1000000000000000000000000000000000000001".parse().unwrap();
+        let err = build_account_info(
+            addr,
+            Ok(1),
+            Err(anyhow::anyhow!("balance timeout")),
+            Ok(Bytes::new()),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("failed to fetch balance"));
+    }
+
+    #[test]
+    fn storage_prefetch_propagates_rpc_errors() {
+        let addr: Address = "0x1000000000000000000000000000000000000001".parse().unwrap();
+        let slot = U256::from(42);
+        let err = build_storage_entry(addr, slot, Err(anyhow::anyhow!("storage timeout"))).unwrap_err();
+
+        assert!(err.to_string().contains("failed to fetch storage"));
+    }
+
+    #[test]
+    fn storage_queries_are_deduplicated() {
+        let addr: Address = "0x1000000000000000000000000000000000000001".parse().unwrap();
+        let key = alloy_primitives::B256::ZERO;
+        let access_list = vec![
+            AccessListEntry {
+                address: addr,
+                storage_keys: Some(vec![key, key]),
+            },
+            AccessListEntry {
+                address: addr,
+                storage_keys: Some(vec![key]),
+            },
+        ];
+
+        let queries = collect_storage_queries(Some(&access_list));
+
+        assert_eq!(queries, vec![(addr, U256::ZERO)]);
+    }
 }

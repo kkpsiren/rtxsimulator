@@ -36,8 +36,8 @@ pub fn decode_calldata_effects(
             decode_transfer_from_721(contract, params)
         }
         SET_APPROVAL_FOR_ALL => decode_set_approval_for_all(contract, caller, params),
-        SAFE_TRANSFER_FROM_1155 => decode_safe_transfer_1155(contract, params),
-        SAFE_BATCH_TRANSFER_1155 => decode_safe_batch_transfer_1155(contract, params),
+        SAFE_TRANSFER_FROM_1155 => decode_safe_transfer_1155(contract, caller, params),
+        SAFE_BATCH_TRANSFER_1155 => decode_safe_batch_transfer_1155(contract, caller, params),
         PERMIT => decode_permit(contract, params),
         _ => Vec::new(),
     }
@@ -152,7 +152,7 @@ fn decode_set_approval_for_all(
 }
 
 // safeTransferFrom(address from, address to, uint256 id, uint256 value, bytes data)
-fn decode_safe_transfer_1155(token: Address, params: &[u8]) -> Vec<Effect> {
+fn decode_safe_transfer_1155(token: Address, operator: Address, params: &[u8]) -> Vec<Effect> {
     let Some(from) = read_address(params, 0) else {
         return Vec::new();
     };
@@ -165,10 +165,9 @@ fn decode_safe_transfer_1155(token: Address, params: &[u8]) -> Vec<Effect> {
     let Some(value) = read_u256(params, 96) else {
         return Vec::new();
     };
-    // We use Erc1155TransferSingle; operator = from since we decode from calldata
     vec![Effect::Erc1155TransferSingle {
         token,
-        operator: from,
+        operator,
         from,
         to,
         id,
@@ -196,7 +195,11 @@ fn decode_permit(token: Address, params: &[u8]) -> Vec<Effect> {
 }
 
 // safeBatchTransferFrom(address from, address to, uint256[] ids, uint256[] values, bytes data)
-fn decode_safe_batch_transfer_1155(token: Address, params: &[u8]) -> Vec<Effect> {
+fn decode_safe_batch_transfer_1155(
+    token: Address,
+    operator: Address,
+    params: &[u8],
+) -> Vec<Effect> {
     let Some(from) = read_address(params, 0) else {
         return Vec::new();
     };
@@ -222,7 +225,7 @@ fn decode_safe_batch_transfer_1155(token: Address, params: &[u8]) -> Vec<Effect>
 
     vec![Effect::Erc1155TransferBatch {
         token,
-        operator: from,
+        operator,
         from,
         to,
         ids,
@@ -247,4 +250,71 @@ fn read_u256_array(params: &[u8], offset: usize) -> Vec<U256> {
         out.push(val);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_sol_types::{SolCall, sol};
+
+    sol! {
+        function safeTransferFrom(address from, address to, uint256 id, uint256 value, bytes data);
+        function safeBatchTransferFrom(address from, address to, uint256[] ids, uint256[] values, bytes data);
+    }
+
+    #[test]
+    fn erc1155_single_uses_caller_as_operator() {
+        let token: Address = "0x1000000000000000000000000000000000000001".parse().unwrap();
+        let caller: Address = "0x2000000000000000000000000000000000000002".parse().unwrap();
+        let from: Address = "0x3000000000000000000000000000000000000003".parse().unwrap();
+        let to: Address = "0x4000000000000000000000000000000000000004".parse().unwrap();
+        let data = Bytes::from(
+            safeTransferFromCall {
+                from,
+                to,
+                id: U256::from(1),
+                value: U256::from(5),
+                data: Bytes::new(),
+            }
+            .abi_encode(),
+        );
+
+        let effects = decode_calldata_effects(token, caller, &data);
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Erc1155TransferSingle { operator, from: effect_from, to: effect_to, .. }]
+                if *operator == caller && *effect_from == from && *effect_to == to
+        ));
+    }
+
+    #[test]
+    fn erc1155_batch_uses_caller_as_operator() {
+        let token: Address = "0x1000000000000000000000000000000000000001".parse().unwrap();
+        let caller: Address = "0x2000000000000000000000000000000000000002".parse().unwrap();
+        let from: Address = "0x3000000000000000000000000000000000000003".parse().unwrap();
+        let to: Address = "0x4000000000000000000000000000000000000004".parse().unwrap();
+        let data = Bytes::from(
+            safeBatchTransferFromCall {
+                from,
+                to,
+                ids: vec![U256::from(1), U256::from(2)],
+                values: vec![U256::from(5), U256::from(8)],
+                data: Bytes::new(),
+            }
+            .abi_encode(),
+        );
+
+        let effects = decode_calldata_effects(token, caller, &data);
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Erc1155TransferBatch { operator, from: effect_from, to: effect_to, ids, values, .. }]
+                if *operator == caller
+                    && *effect_from == from
+                    && *effect_to == to
+                    && ids == &vec![U256::from(1), U256::from(2)]
+                    && values == &vec![U256::from(5), U256::from(8)]
+        ));
+    }
 }

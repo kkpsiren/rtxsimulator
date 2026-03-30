@@ -2,6 +2,10 @@
 name = "simulate-tx"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "WebAssembly package for simulating EVM transactions"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

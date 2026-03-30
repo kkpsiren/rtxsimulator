@@ -60,14 +60,7 @@ pub async fn simulate_rpc(
     };
 
     // ── Process trace result ──────────────────────────────────────────
-    let mut calls = Vec::new();
-    let mut logs = Vec::new();
-    let mut gas_used = 0u64;
-
-    if let Ok(trace) = trace_result {
-        gas_used = u64::from_str_radix(trace.gas_used.trim_start_matches("0x"), 16).unwrap_or(0);
-        flatten_trace(&trace, &mut calls, &mut logs);
-    }
+    let (gas_used, calls, logs) = process_trace_result(trace_result)?;
 
     // Filter out ZkSync system contract noise.
     let user_calls: Vec<InternalCall> = calls
@@ -76,36 +69,7 @@ pub async fn simulate_rpc(
         .collect();
 
     // ── Decode effects ────────────────────────────────────────────────
-    let mut effects = Vec::new();
-
-    if let Some(to) = req.to {
-        if req.value > U256::ZERO {
-            effects.push(Effect::NativeTransfer {
-                from: req.from,
-                to,
-                value: req.value,
-            });
-        }
-        effects.extend(decode_calldata_effects(to, req.from, &req.data));
-    }
-
-    for call in &user_calls {
-        if call.value > U256::ZERO {
-            effects.push(Effect::NativeTransfer {
-                from: call.caller,
-                to: call.target,
-                value: call.value,
-            });
-        }
-        if call.input != req.data {
-            effects.extend(decode_calldata_effects(call.target, call.caller, &call.input));
-        }
-    }
-
-    if !logs.is_empty() {
-        let log_effects = crate::decoder::decode_effects(&logs, &[]);
-        effects.extend(log_effects);
-    }
+    let effects = collect_effects(req, &user_calls, &logs);
 
     Ok(SimulationResult {
         success,
@@ -116,6 +80,46 @@ pub async fn simulate_rpc(
         logs,
         calls: user_calls,
     })
+}
+
+fn process_trace_result<E: std::fmt::Display>(
+    trace_result: Result<CallTrace, E>,
+) -> anyhow::Result<(u64, Vec<InternalCall>, Vec<EmittedLog>)> {
+    let trace = trace_result.map_err(|e| anyhow::anyhow!("debug_traceCall failed: {e}"))?;
+    let gas_used = u64::from_str_radix(trace.gas_used.trim_start_matches("0x"), 16).unwrap_or(0);
+    let mut calls = Vec::new();
+    let mut logs = Vec::new();
+    flatten_trace(&trace, &mut calls, &mut logs);
+    logs.retain(|log| !is_system_address(&log.address));
+    Ok((gas_used, calls, logs))
+}
+
+fn collect_effects(
+    _req: &SimulationRequest,
+    user_calls: &[InternalCall],
+    logs: &[EmittedLog],
+) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    let decode_from_calldata = logs.is_empty();
+
+    for call in user_calls {
+        if call.value > U256::ZERO {
+            effects.push(Effect::NativeTransfer {
+                from: call.caller,
+                to: call.target,
+                value: call.value,
+            });
+        }
+        if decode_from_calldata && !call.input.is_empty() {
+            effects.extend(decode_calldata_effects(call.target, call.caller, &call.input));
+        }
+    }
+
+    if !logs.is_empty() {
+        effects.extend(crate::decoder::decode_effects(logs, &[]));
+    }
+
+    effects
 }
 
 // ── Trace types ───────────────────────────────────────────────────────
@@ -228,4 +232,49 @@ fn extract_rpc_revert_reason(error_msg: &str) -> String {
         return hex_part[..end].to_string();
     }
     error_msg.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trace_failures_are_returned_as_errors() {
+        let err = process_trace_result(Err("trace unavailable".to_string())).unwrap_err();
+        assert!(err.to_string().contains("debug_traceCall failed"));
+    }
+
+    #[test]
+    fn top_level_native_transfer_is_not_duplicated() {
+        let from: Address = "0x1000000000000000000000000000000000000001".parse().unwrap();
+        let to: Address = "0x2000000000000000000000000000000000000002".parse().unwrap();
+        let req = SimulationRequest {
+            from,
+            to: Some(to),
+            data: "0x".parse().unwrap(),
+            value: U256::from(7),
+            chain_id: 324,
+            block_number: None,
+            gas_limit: None,
+        };
+        let calls = vec![InternalCall {
+            depth: 0,
+            caller: from,
+            target: to,
+            value: U256::from(7),
+            input: "0x".parse().unwrap(),
+            gas_limit: 21_000,
+            call_type: CallType::Call,
+        }];
+
+        let effects = collect_effects(&req, &calls, &[]);
+
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::NativeTransfer { .. }))
+                .count(),
+            1
+        );
+    }
 }
