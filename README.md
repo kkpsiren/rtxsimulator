@@ -194,6 +194,14 @@ crates/wasm   → WebAssembly package (npm: simulate-tx)
 
 The release process is documented in [docs/release-workflow.md](docs/release-workflow.md). Follow that workflow to keep the workspace version, git tags, and published packages aligned.
 
+For npm package continuity, the release artifact should be built with:
+
+```bash
+./scripts/build-nodejs-npm-package.sh
+```
+
+That preserves the existing published `simulate-tx` package shape before `npm publish` is run from `crates/wasm/pkg`.
+
 ## License
 
 MIT

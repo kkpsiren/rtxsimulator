@@ -49,10 +49,10 @@ cargo package -p rtxsimulator --allow-dirty
 cargo package -p rtxsimulator-cli --allow-dirty
 ```
 
-For the npm/WASM package, build the distributable package first:
+For the npm/WASM package, preserve compatibility with the existing published `simulate-tx` package shape. Build the Node.js-targeted package and then prepare the generated `pkg/` directory for npm:
 
 ```bash
-wasm-pack build crates/wasm --target bundler --release
+./scripts/build-nodejs-npm-package.sh
 ```
 
 ## Tag and push
@@ -79,8 +79,11 @@ cargo publish -p rtxsimulator-cli
 WASM / npm package:
 
 ```bash
-wasm-pack publish crates/wasm
+cd crates/wasm/pkg
+npm publish --access public
 ```
+
+This repository's published npm package lineage (`0.1.0` and `0.1.1`) was generated from `wasm-pack --target nodejs`, not the bundler target. Do not switch release targets casually, or consumers will get a different JS package shape.
 
 ## Post-release check
 
