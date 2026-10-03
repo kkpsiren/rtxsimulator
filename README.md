@@ -4,7 +4,7 @@ Lean EVM transaction simulator. Simulates what a transaction would do without se
 
 Works on any EVM chain. Supports both standard EVM and EraVM (ZkSync stack) chains.
 
-**Decodes:** native transfers, ERC-20/721/1155 transfers & approvals, setApprovalForAll, Permit/Permit2, internal calls, contract creations, selfdestructs, revert reasons.
+**Decodes:** native transfers, ERC-20/721/1155 transfers & approvals, setApprovalForAll, EIP-2612 permit, `Permit2Approval` logs, internal calls, contract creations, selfdestructs, revert reasons.
 
 ## Supported chains
 
@@ -118,7 +118,7 @@ let result = simulate(&req, "https://eth.llamarpc.com").await?;
 - `Erc1155TransferSingle` / `Erc1155TransferBatch` — multi-token transfers
 - `ApprovalForAll` — operator grant (ERC-721/1155)
 - `Permit` — EIP-2612 permit
-- `Permit2Approval` — Uniswap Permit2
+- `Permit2Approval` — decodes the log event `Permit2Approval(address indexed owner, address indexed token, address indexed spender, uint160 amount, uint48 expiration)`
 - `ContractCreated` — new contract deployed
 - `SelfDestruct` — contract self-destructed
 
@@ -163,7 +163,8 @@ Bottleneck is RPC latency. With a local node, revm execution is <10ms.
 
 ## WASM
 
-The npm package is a WebAssembly binary compiled from Rust. It runs in Node.js, Deno, and browsers.
+The npm package is a WebAssembly binary compiled from Rust.
+The published package targets Node.js.
 
 - revm uses pure-Rust crypto on WASM (no C FFI)
 - HTTP uses the browser `fetch` API via reqwest + wasm-bindgen
